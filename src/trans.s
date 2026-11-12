@@ -14,6 +14,18 @@
 .equ	HCR_EL2_TGE,		1 << 27	/* Traps general exceptions. */
 .equ	HCR_EL2_E2H,		1 << 34	/* EL2 Host. */
 
+.ifdef SLBOUNCE_SP11_DEVHE
+/* docs/SP11-Q1N1-BOOT-STUDY.md section 6 / docs/SP11-EL2-ENTRY.md section 2.3's canonical
+ * sequence: the non-VHE EL2 state q1n1 already sees on the A16 (HCR_EL2 OBSERVED there,
+ * docs/A16-Q1N1-PROXY.md in the q1n1 tree; E2H clear, RW and TGE set) and a maximally permissive
+ * non-VHE CPTR_EL2 (RES1 only: nothing trapped -- the same value every sequence in the host
+ * model's own canonical data uses for this register, compat/el2-entry-model.c
+ * EL2M_CANON_CPTR). Neither is a conversion of a saved image: there is no "HCR_EL1" or
+ * "CPTR_EL1" to convert from (this patch's REPORT.md explains the CPTR case fully). */
+.equ	SP11_DEVHE_HCR_A16,	0x88000010
+.equ	SP11_DEVHE_CPTR_NOTRAP,	0x22ff
+.endif
+
 
 /*
  * tb_entry() - Entry point for "Transition back" feature of tcblaunch.exe
@@ -157,6 +169,79 @@ tb_longjmp:
 		//cptr_el2
 
 	/* ArchInitialize() */
+.ifdef SLBOUNCE_SP11_DEVHE
+	/* The SP11 fork: give the EFI application and q1n1 a non-VHE EL2 instead of the VHE one
+	 * slbounce gives every other target (docs/SP11-Q1N1-BOOT-STUDY.md section 6). x0 (the
+	 * jmp_buf pointer) moves to x19, and x1 (the caller's retval argument, used again at this
+	 * function's very end) moves to x20 -- neither is restored from the jmp_buf until the ldp
+	 * sequence below, so both are safe to use as scratch here -- freeing x0/x1 for
+	 * sp11_devhe_tcr_vhe_to_nvhe's argument and two-register return value. */
+	mov	x19, x0
+	mov	x20, x1
+
+	movq	x2, SP11_DEVHE_HCR_A16
+	msr	hcr_el2, x2
+	isb
+
+	/* CNTHCTL_EL2, non-VHE layout: the same two bits and the same numeric value as the plain
+	 * build's write below, but E2H is already 0 here, so they now mean what this file's own
+	 * CNTHCTL_EL2_EL1PCTEN/EL1PCEN comment says (EL1 passthrough), not the VHE layout's EL0
+	 * controls those bit positions actually are under E2H=1 (REPORT.md). */
+	mov	x2, #(CNTHCTL_EL2_EL1PCTEN | CNTHCTL_EL2_EL1PCEN)
+	msr	cnthctl_el2, x2
+
+	/* CPTR_EL2, non-VHE layout: fixed, maximally permissive (REPORT.md: no conversion of
+	 * cpacr_el1 is attempted; neither does the host model's own canonical data). */
+	movq	x2, SP11_DEVHE_CPTR_NOTRAP
+	msr	cptr_el2, x2
+
+	/* TTBR0_EL2, non-VHE layout: el2m_ttbr0_vhe_to_nvhe's whole body (clear the ASID, RES0
+	 * unless E2H is 1) is one instruction, done inline rather than called. */
+	ldr	x2, [x19, #128]
+	and	x2, x2, #0x0000ffffffffffff
+	msr	ttbr0_el2, x2
+
+	/* TCR_EL2, non-VHE layout: the eleven-field remap, out of line (sp11_devhe_convert.c). On
+	 * SP11_DEVHE_TCR_INVALID (x1 == 0) halt rather than risk writing an unconvertible image:
+	 * the existing fail-safe loop below, not a new one. */
+	ldr	x0, [x19, #136]
+	bl	sp11_devhe_tcr_vhe_to_nvhe
+	cbz	x1, halt
+	msr	tcr_el2, x0
+	/* MAIR_EL2 (below, unchanged): no VHE/non-VHE layout difference exists for it
+	 * (docs/SP11-EL2-ENTRY.md section 2.7's layout list does not name it), so the saved
+	 * mair_el1 image is valid as MAIR_EL2 verbatim in either regime. */
+	ldr	x2, [x19, #144]
+	msr	mair_el2, x2
+
+	/* Restore x0 = the jmp_buf pointer and x1 = the caller's retval (both clobbered above by
+	 * the TCR call's argument and two-register return value): every instruction after this
+	 * point, unchanged by this gate, addresses the jmp_buf through x0 and the final return
+	 * value computation through x1. */
+	mov	x0, x19
+	mov	x1, x20
+
+	/* A second TLBI, with its own barriers, after every translation-relevant register
+	 * (TTBR0_EL2, TCR_EL2, MAIR_EL2) has been rewritten above and before SCTLR_EL2 turns the
+	 * MMU back on below: compat/el2-entry-model.c's el2m_seq_slbounce_devhe (the canonical,
+	 * host-tested reference this trans.s change ports) requires this exact "DSB, TLBI, DSB,
+	 * ISB" after its own register-write group, not only the TLBI the unmodified code above
+	 * already runs before any register is touched (SP11-EL2-ENTRY.md section 2.3 steps 10-13;
+	 * section 2.5 on this exact placement: "a second one, with its barriers, follows the
+	 * register writes"). Without it the model refuses the sequence as MMU_ON_STALE_TLB even
+	 * though the first, earlier TLBI already ran -- that first one precedes the new TCR/TTBR0
+	 * configuration being installed, so it cannot be relied on to cover any translation a
+	 * speculative walk forms under the new configuration while the MMU is still (architecturally)
+	 * capable of being re-enabled with stale state (section 2.11: the model does not assume away
+	 * speculative TLB fills). The VHE (`.else`) path below is unchanged and does not get this
+	 * second TLBI: el2m_ref_slbounce_vhe is only accepted with strict_tlbi_after_config relaxed,
+	 * i.e. it is OBSERVED to work on real hardware without it, and nothing here may alter that
+	 * path (the non-SP11 behaviour is not this patch's to change). */
+	dsb	ish
+	tlbi	alle2
+	dsb	ish
+	isb
+.else
 	movq	x2, (HCR_EL2_TGE | HCR_EL2_E2H)
 	msr	hcr_el2, x2
 	isb
@@ -172,6 +257,7 @@ tb_longjmp:
 
 	dsb	ish
 	isb
+.endif
 
 	ldr	x2, [x0,#152]
 	movq	x3, ~SCTLR_EL2_RES0
