@@ -32,7 +32,12 @@ Runs:
     writes, required by el2m_seq_slbounce_devhe but absent from an earlier draft of this patch)
     was found by manual review against the model during this patch's own development -- see
     REPORT.md. MutateTransSequence reintroduces that same mistake and confirms TransSequence
-    catches it, so the regression this test exists for has its own seeded-bug proof.
+    catches it, so the regression this test exists for has its own seeded-bug proof;
+  * TbWindow: links the DEVHE build with the project's own Makefile, reads the link map, and checks
+    that the converter lies inside the transition-back image sl.c hands tcblaunch (the pages from
+    tb_entry's page, tb_size of them), where upstream's tb_entry..tb_longjmp already lives; the old
+    far placement, relinked as a seeded mutant, must fail the same check (SKIP without
+    aarch64-elf-gcc).
 
 SNAPINTOSH_DIR: a Snapintosh checkout carrying compat/el2-entry-model.c (SKIP the CrossLanguage
 class, and the cross-check half of TransSequence, without it). Nothing is written outside build/.
@@ -514,6 +519,91 @@ class MutateTransSequence(unittest.TestCase):
         seq.objdump = shutil.which('aarch64-elf-objdump')
         observed = seq._sequence(defsym=True, source_path=mutant_path)
         self.assertNotEqual(observed, EXPECTED_ON, 'mutation (dropped second TLBI) was not caught')
+
+
+def _link_with_map(out_dir, map_path, reorder=None):
+    """Builds the DEVHE-gated slbounce.so under out_dir with the project's own Makefile and a link
+    map next to it. `reorder`, if given, is a callable that rearranges the link line's argument list
+    (used by the mutation below to put the converter back at the end, where it used to be)."""
+    shutil.rmtree(out_dir, ignore_errors=True)
+    args = ['make', f'OUT_DIR={out_dir}', 'CROSS_COMPILE=aarch64-elf-', 'SLBOUNCE_ALWAYS_SWITCH=1', 'DEBUG=1',
+            'SLBOUNCE_SCOPED_SWEEP=1', 'SLBOUNCE_SP11_DEVHE=1', '-j4']
+    so = out_dir / 'slbounce.so'
+    env = dict(ENV)
+    # LDFLAGS in the environment is appended to by the Makefile's own `LDFLAGS +=`, not replaced.
+    env['LDFLAGS'] = f'-Wl,-Map,{map_path}'
+    done = subprocess.run(args + [str(so)], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+    if reorder is None:
+        return
+    # Relink by hand with the same link line, rearranged, and a second map for the mutant.
+    dry = subprocess.run(args + ['-n', '-B', str(so)], cwd=ROOT, env=ENV, capture_output=True, text=True).stdout
+    line = next(l for l in dry.splitlines() if 'aarch64-elf-gcc' in l and f'-o {so}' in l)
+    import shlex
+    argv = [a for a in shlex.split(line) if a != '-s']
+    argv = reorder(argv, out_dir)
+    argv[argv.index('-o') + 1] = str(out_dir / 'mutant.so')
+    argv.insert(1, f'-Wl,-Map,{map_path}')
+    done = subprocess.run(argv, cwd=ROOT, env=ENV, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+
+
+def _tb_window(map_text):
+    """(window_start, window_end, converter_start, converter_end) from a GNU ld map, using the same
+    definition sl.c gives tcblaunch: the pages from tb_entry's page, tb_size of them."""
+    sl = (ROOT / 'src/sl.c').read_text(encoding='utf-8')
+    pages = int(re.search(r'tb_size\s*=\s*4096\s*\*\s*(\d+)\s*;', sl).group(1))
+    entry = int(re.search(r'^\s+0x([0-9a-f]+)\s+tb_entry\s*$', map_text, re.M).group(1), 16)
+    conv_sym = int(re.search(r'^\s+0x([0-9a-f]+)\s+sp11_devhe_tcr_vhe_to_nvhe\s*$', map_text, re.M).group(1), 16)
+    sect = re.search(r'^ \.text\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+\S*sp11_devhe_convert\.o\s*$', map_text, re.M)
+    start, size = int(sect.group(1), 16), int(sect.group(2), 16)
+    assert start <= conv_sym < start + size
+    window_start = entry & ~0xfff
+    return window_start, window_start + 4096 * pages, start, start + size
+
+
+class TbWindow(unittest.TestCase):
+    """trans.s calls sp11_devhe_tcr_vhe_to_nvhe from tb_longjmp, with the MMU off, after tcblaunch has
+    handed EL2 back. sl.c defines the transition-back image as the pages starting at tb_entry's page
+    (tb_virt = tb_entry & ~0xfff, tb_size = 2 pages), and upstream's tb_entry..tb_longjmp lies wholly
+    inside it. The converter is a new callee, so it has to lie inside it too: a call out of the window
+    would be the first instruction fetch from an image page that upstream's design never relies on for
+    this path. The Makefile links the converter straight after trans.o for exactly this reason; this
+    reads the link map and fails if that ever stops being true."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not (have('aarch64-elf-gcc') and have('make')):
+            raise unittest.SkipTest('aarch64-elf-gcc/make not installed')
+        BUILD.mkdir(parents=True, exist_ok=True)
+        cls.map = BUILD / 'tb-window.map'
+        _link_with_map(BUILD / 'tb-window', cls.map)
+        cls.text = cls.map.read_text(encoding='utf-8', errors='replace')
+
+    def test_the_converter_lies_inside_the_transition_back_image(self):
+        lo, hi, start, end = _tb_window(self.text)
+        self.assertTrue(lo <= start and end <= hi, f'converter {start:#x}..{end:#x} outside TB window {lo:#x}..{hi:#x}')
+
+    def test_all_of_trans_o_lies_inside_the_window_too(self):
+        lo, hi, _, _ = _tb_window(self.text)
+        sect = re.search(r'^ \.text\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+\S*src/trans\.o\s*$', self.text, re.M)
+        start, size = int(sect.group(1), 16), int(sect.group(2), 16)
+        self.assertTrue(lo <= start and start + size <= hi)
+
+    def test_a_far_placement_is_caught(self):
+        """The old order (converter after libfdt) must fail the same check, or the check proves nothing."""
+        def to_the_end(argv, out_dir):
+            conv = str(out_dir / 'src/sp11_devhe_convert.o')
+            argv = [a for a in argv if a != conv]
+            # After the last object, before the libraries and the linker script (-lefi ... -T script).
+            last_obj = max(i for i, a in enumerate(argv) if a.endswith('.o'))
+            argv.insert(last_obj + 1, conv)
+            return argv
+
+        mutant_map = BUILD / 'tb-window-mutant.map'
+        _link_with_map(BUILD / 'tb-window-mutant', mutant_map, reorder=to_the_end)
+        lo, hi, start, end = _tb_window(mutant_map.read_text(encoding='utf-8', errors='replace'))
+        self.assertFalse(lo <= start and end <= hi, 'the mutant placement was not caught')
 
 
 if __name__ == '__main__':

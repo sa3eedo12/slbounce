@@ -95,12 +95,21 @@ SLTEST_OBJS := \
 SLBOUNCE_LDFLAGS := \
 	-Wl,--defsym=EFI_SUBSYSTEM=$(SUBSYSTEM_RT)
 
+# Objects trans.s calls, linked immediately after trans.o so that they land inside the two-page
+# transition-back image sl.c hands tcblaunch (tb_virt is tb_entry's page, tb_size two pages): empty,
+# and therefore absent from the link line, unless a gate below fills it.
+SLBOUNCE_TB_OBJS :=
+ifneq ($(SLBOUNCE_SP11_DEVHE),)
+SLBOUNCE_TB_OBJS := $(OUT_DIR)/src/sp11_devhe_convert.o
+endif
+
 SLBOUNCE_OBJS := \
 	$(OUT_DIR)/src/bounce_main.o \
 	$(OUT_DIR)/src/util.o \
 	$(OUT_DIR)/src/arch.o \
 	$(OUT_DIR)/src/sl.o \
 	$(OUT_DIR)/src/trans.o \
+	$(SLBOUNCE_TB_OBJS) \
 	$(OUT_DIR)/src/libc.o \
 	$(LIBFDT_OBJS)
 
@@ -111,14 +120,11 @@ SLBOUNCE_OBJS += $(OUT_DIR)/src/sp11_scoped_sweep.o
 endif
 
 # Default off: the TCR_EL2 conversion trans.s calls under SLBOUNCE_SP11_DEVHE (sp11_devhe_convert.h)
-# is linked in only with SLBOUNCE_SP11_DEVHE=1; without it trans.o's own SP11_DEVHE branch, and
-# hence any reference to this symbol, does not exist either (trans.s's own .ifdef), so an SP11_DEVHE
-# build without SLBOUNCE_SCOPED_SWEEP is still valid, but never the reverse omission of this object.
-# Its own build rule (the -O2 override) is below, after `all`, so it is not mistaken for this
-# Makefile's default goal.
-ifneq ($(SLBOUNCE_SP11_DEVHE),)
-SLBOUNCE_OBJS += $(OUT_DIR)/src/sp11_devhe_convert.o
-endif
+# is linked in only with SLBOUNCE_SP11_DEVHE=1 (through SLBOUNCE_TB_OBJS above); without it
+# trans.o's own SP11_DEVHE branch, and hence any reference to this symbol, does not exist either
+# (trans.s's own .ifdef), so an SP11_DEVHE build without SLBOUNCE_SCOPED_SWEEP is still valid, but
+# never the reverse omission of this object. Its own build rule (the -O2 override) is below, after
+# `all`, so it is not mistaken for this Makefile's default goal.
 
 
 # trans.s carries the EL2 de-VHE conversion (docs/SP11-Q1N1-BOOT-STUDY.md section 6) only under
