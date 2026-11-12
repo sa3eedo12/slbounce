@@ -18,6 +18,8 @@ Runs:
     compat/el2-entry-model.c el2m_tcr_vhe_to_nvhe() agree on a battery of generated TCR_EL1-format
     images, including every edge case the Native tests exercise and 2000 pseudo-random ones (SKIP
     without SNAPINTOSH_DIR);
+  * ObservedUnit: the real converter on the TCR_EL2 image the Surface Pro 11 unit actually held
+    after the bounce (OBSERVED, one run), with no Snapintosh checkout needed;
   * Mutations: four seeded bugs are each confirmed to change this function's behaviour;
   * TransSequence: assembles the real src/trans.s with aarch64-elf-as, with and without
     -DSLBOUNCE_SP11_DEVHE (--defsym), disassembles tb_longjmp, and checks the *order* of
@@ -67,6 +69,14 @@ def run(cmd, **kw):
 
 def have(tool):
     return shutil.which(tool) is not None
+
+
+# The TCR_EL2 the Surface Pro 11 unit held after slbounce's bounce under the unmodified VHE restore
+# (a TCR_EL1-format image: T0SZ 20, 4 KiB granule, IPS 44 bits, EPD1 set), read by q1n1 91748c0's EL2
+# page on 2026-11-12 (OBSERVED, one run; docs/SURFACE-PRO-11.md in the Snapintosh repository). The
+# non-VHE image below keeps the same TTBR0 walk and is what the trampoline would write.
+OBSERVED_UNIT_TCR = 0x480803514
+OBSERVED_UNIT_TCR_NVHE = 0x80843514
 
 
 class Native(unittest.TestCase):
@@ -208,6 +218,7 @@ class CrossLanguage(unittest.TestCase):
             0x00000035b5103510 & ~(3 << 30),  # TG1 = 0b00: invalid
             0x00000035b5103510 | (1 << 35),  # RES0 violation: invalid
             0,                                # all zero: TG1 = 0b00, invalid
+            OBSERVED_UNIT_TCR,                # what the Surface Pro 11 held after the bounce
         ]
         mine = self._query(self.mine, values)
         model = self._query(self.model, values)
@@ -219,6 +230,45 @@ class CrossLanguage(unittest.TestCase):
         mine = self._query(self.mine, values)
         model = self._query(self.model, values)
         self.assertEqual(mine, model)
+
+
+class ObservedUnit(unittest.TestCase):
+    """The real converter on the image the unit actually held, with no Snapintosh checkout needed: a
+    conversion proven only on synthetic images says nothing about the walk this firmware configured."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.have_c = have('clang')
+        if not cls.have_c:
+            return
+        BUILD.mkdir(parents=True, exist_ok=True)
+        cls.cli = BUILD / 'devhe-cli-observed'
+        done = run(['clang'] + SANITIZE + ['tools/sp11_devhe_cli.c', '-o', str(cls.cli)])
+        assert done.returncode == 0, done.stderr
+
+    def setUp(self):
+        if not self.have_c:
+            self.skipTest('clang not installed')
+
+    def _convert(self, value):
+        done = subprocess.run([str(self.cli)], input=f'{value:x}\n', env=ENV, capture_output=True, text=True,
+                              cwd=ROOT)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip()
+
+    def test_observed_tcr_keeps_the_walk_in_the_nonvhe_layout(self):
+        self.assertEqual(self._convert(OBSERVED_UNIT_TCR), f'valid {OBSERVED_UNIT_TCR_NVHE:x}')
+        # The fields TTBR0's walk depends on are carried bit for bit: T0SZ, IRGN0, ORGN0, SH0, TG0.
+        self.assertEqual(OBSERVED_UNIT_TCR & 0xff3f, OBSERVED_UNIT_TCR_NVHE & 0xff3f)
+        # IPS (bits 34:32) moves to PS (bits 18:16); the two non-VHE RES1 bits (31, 23) are set.
+        self.assertEqual((OBSERVED_UNIT_TCR >> 32) & 7, (OBSERVED_UNIT_TCR_NVHE >> 16) & 7)
+        self.assertEqual(OBSERVED_UNIT_TCR_NVHE & ((1 << 31) | (1 << 23)), (1 << 31) | (1 << 23))
+
+    def test_a_wrong_conversion_of_the_observed_tcr_is_not_accepted(self):
+        # EPD0 set would mean the unit's own TTBR0 walk is off: nothing to carry, so it must refuse.
+        self.assertEqual(self._convert(OBSERVED_UNIT_TCR | (1 << 7)), 'invalid')
+        # TG1 = 0b00 is the reserved granule encoding in the TCR_EL1 layout.
+        self.assertEqual(self._convert(OBSERVED_UNIT_TCR & ~(3 << 30)), 'invalid')
 
 
 class Mutations(unittest.TestCase):
