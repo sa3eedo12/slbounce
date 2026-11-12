@@ -21,6 +21,10 @@
 #include "sp11_scoped_sweep.h"
 #endif
 
+#ifdef SLBOUNCE_SP11_MARKERS
+#include "sp11_marker_surface.h"
+#endif
+
 /**
  * sl_is_allowed_by_fdt() - Check if dtb is configured for el2.
  *
@@ -163,6 +167,57 @@ static EFI_STATUS sp11_run_scoped_sweep(void)
 }
 #endif /* SLBOUNCE_SCOPED_SWEEP */
 
+#ifdef SLBOUNCE_SP11_MARKERS
+/*
+ * Arms the de-VHE trampoline's progress markers (sp11_marker_surface.h): finds the GOP
+ * framebuffer, checks it against the memory map q1n1 just fetched, draws slot 0 to say so, and hands
+ * the strip's address and stride to trans.s through two extra words of tb_jmp_buf. Any doubt leaves
+ * both words zero, and the trampoline then draws nothing.
+ *
+ * This runs between q1n1's last GetMemoryMap and the real ExitBootServices, so it must not allocate:
+ * any allocation changes the map and invalidates the MapKey q1n1 passed. LocateProtocol does not
+ * allocate; Print, LibLocateProtocol and LibLocateHandle do, so none of them is used here. The cost
+ * is that a refusal is silent; slot 0 not appearing is how it shows.
+ */
+static void sp11_arm_progress_markers(void)
+{
+	EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+	EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+	struct sp11_marker_strip strip;
+	struct sp11_marker_fb fb;
+
+	tb_jmp_buf[21] = 0;
+	tb_jmp_buf[22] = 0;
+
+	if (EFI_ERROR(uefi_call_wrapper(BS->LocateProtocol, 3, &gop_guid, NULL, (VOID **)&gop)))
+		return;
+	if (!gop || !gop->Mode || !gop->Mode->Info)
+		return;
+
+	fb.base = gop->Mode->FrameBufferBase;
+	fb.size_bytes = gop->Mode->FrameBufferSize;
+	fb.width = gop->Mode->Info->HorizontalResolution;
+	fb.height = gop->Mode->Info->VerticalResolution;
+	fb.pixels_per_scanline = gop->Mode->Info->PixelsPerScanLine;
+	fb.pixel_format = gop->Mode->Info->PixelFormat;
+
+	if (sp11_marker_plan((const uint8_t *)LastMemoryMap, LastMemoryMapSize, LastDescriptorSize, &fb, &strip) !=
+	    SP11_MARKER_OK)
+		return;
+
+	volatile uint32_t *row = (volatile uint32_t *)(uintptr_t)strip.origin;
+	for (uint32_t y = 0; y < SP11_MARKER_SIDE_PX; y++) {
+		for (uint32_t x = 0; x < SP11_MARKER_SIDE_PX; x++)
+			row[x] = 0xffffffffu;
+		row = (volatile uint32_t *)((uintptr_t)row + strip.stride_bytes);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	tb_jmp_buf[21] = strip.origin;
+	tb_jmp_buf[22] = strip.stride_bytes;
+}
+#endif /* SLBOUNCE_SP11_MARKERS */
+
 EFI_STATUS sl_ExitBootServices(EFI_HANDLE ImageHandle, UINTN MapKey)
 {
 	uint64_t smcret = 0;
@@ -215,6 +270,10 @@ EFI_STATUS sl_ExitBootServices(EFI_HANDLE ImageHandle, UINTN MapKey)
 	}
 #endif
 
+#ifdef SLBOUNCE_SP11_MARKERS
+	sp11_arm_progress_markers();
+#endif
+
 	EFI_STATUS status = uefi_call_wrapper(real_ExitBootServices, 2, ImageHandle, MapKey);
 	if (EFI_ERROR(status))
 		return status;
@@ -225,7 +284,7 @@ EFI_STATUS sl_ExitBootServices(EFI_HANDLE ImageHandle, UINTN MapKey)
 
 	/* We set a special longjmp point here in hopes SL gets us back. */
 	if (tb_setjmp(tb_jmp_buf) == 0) {
-		clear_dcache_range((uint64_t)tb_jmp_buf, 8*21);
+		clear_dcache_range((uint64_t)tb_jmp_buf, 8*TB_JMP_BUF_QWORDS);
 		smcret = sl_smc(smc_data, SL_CMD_LAUNCH, pe_data, pe_size, arg_data, arg_size);
 		if (smcret)
 			psci_reboot(); /* Indicate a fatal error with a reboot. */

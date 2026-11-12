@@ -41,6 +41,21 @@ endif
 ifneq ($(SLBOUNCE_SP11_DEVHE),)
 	CFLAGS += -DSLBOUNCE_SP11_DEVHE
 endif
+# Progress markers for the de-VHE trampoline (src/sp11_marker_surface.h): a separate opt-in, so that
+# SLBOUNCE_SP11_DEVHE alone is exactly the sequence that was reviewed and host-tested without them.
+# They live inside the de-VHE branch of trans.s, so they need it. The dry run draws the markers and
+# halts before any de-VHE configuration write, to qualify the framebuffer stores on the unit by themselves.
+ifneq ($(SLBOUNCE_SP11_MARKERS),)
+ifeq ($(SLBOUNCE_SP11_DEVHE),)
+$(error SLBOUNCE_SP11_MARKERS=1 needs SLBOUNCE_SP11_DEVHE=1: the markers live in the de-VHE trampoline)
+endif
+	CFLAGS += -DSLBOUNCE_SP11_MARKERS
+endif
+ifneq ($(SLBOUNCE_SP11_MARKERS_DRYRUN),)
+ifeq ($(SLBOUNCE_SP11_MARKERS),)
+$(error SLBOUNCE_SP11_MARKERS_DRYRUN=1 needs SLBOUNCE_SP11_MARKERS=1)
+endif
+endif
 
 ifneq ($(SLBOUNCE_ALWAYS_SWITCH),)
 	CFLAGS  += -DSLBOUNCE_ALWAYS_SWITCH
@@ -113,6 +128,12 @@ SLBOUNCE_OBJS := \
 	$(OUT_DIR)/src/libc.o \
 	$(LIBFDT_OBJS)
 
+# Default off: the progress-marker surface check (sp11_marker_surface.h) is linked in only with
+# SLBOUNCE_SP11_MARKERS=1.
+ifneq ($(SLBOUNCE_SP11_MARKERS),)
+SLBOUNCE_OBJS += $(OUT_DIR)/src/sp11_marker_surface.o
+endif
+
 # Default off: this object (the scoped-sweep validator) is linked in only with
 # SLBOUNCE_SCOPED_SWEEP=1, never otherwise.
 ifneq ($(SLBOUNCE_SCOPED_SWEEP),)
@@ -134,6 +155,12 @@ endif
 # --defsym below, never present at all with the gate off).
 ifneq ($(SLBOUNCE_SP11_DEVHE),)
 ASFLAGS += --defsym SLBOUNCE_SP11_DEVHE=1
+endif
+ifneq ($(SLBOUNCE_SP11_MARKERS),)
+ASFLAGS += --defsym SLBOUNCE_SP11_MARKERS=1
+endif
+ifneq ($(SLBOUNCE_SP11_MARKERS_DRYRUN),)
+ASFLAGS += --defsym SLBOUNCE_SP11_MARKERS_DRYRUN=1
 endif
 
 

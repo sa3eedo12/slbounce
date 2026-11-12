@@ -32,6 +32,12 @@ PRISTINE = os.environ.get('SLBOUNCE_PRISTINE_DIR')
 MAKE_ARGS = ['SLBOUNCE_ALWAYS_SWITCH=1', 'DEBUG=1', 'CROSS_COMPILE=aarch64-elf-']
 KNOWN_GOOD_HASH = 'c78b69fd876005cfa4b760c8a063990425deb490ecf2a323e89bfcf42e1f4803'
 KNOWN_GOOD_SIZE = 105760
+# The two lower-gate builds as they were first built and staged for the unit, before the progress
+# markers existed (2026-11-12). Like the default hash above they are specific to this toolchain; if a
+# later change to the scoped sweep or the de-VHE sequence is meant to alter them, update the hash with
+# that change and say so. They prove that adding the markers changed neither build.
+SCOPED_ONLY = ('54a6115be42a99546e889b6d0877ce63c20884929ce4391d123dfc1923f228d1', 122216)
+DEVHE_NO_MARKERS = ('3032fda349f16d57e8aff228d0ef276d3cd8e5c277f4ea8c67eef6fa4cb508d3', 122240)
 
 
 def have(tool):
@@ -81,7 +87,7 @@ class DefaultOff(unittest.TestCase):
         for rel in ('src/bounce_main.o', 'src/trans.o', 'src/arch.o', 'src/sl.o'):
             self.assertEqual(sha256(mine / rel), sha256(pristine / rel), f'{rel} differs')
         # Only the gated additions exist in neither tree's default object list.
-        for rel in ('src/sp11_scoped_sweep.o', 'src/sp11_devhe_convert.o'):
+        for rel in ('src/sp11_scoped_sweep.o', 'src/sp11_devhe_convert.o', 'src/sp11_marker_surface.o'):
             self.assertFalse((mine / rel).exists(), f'{rel} must not exist in a default build')
 
     @unittest.skipUnless(PRISTINE, 'SLBOUNCE_PRISTINE_DIR not set: no pristine tree to compare against')
@@ -113,7 +119,28 @@ class DefaultOff(unittest.TestCase):
         self.assertNotEqual(sha256(gated_out / 'slbounce.efi'), default_hash)
         self.assertTrue((gated_out / 'src/sp11_scoped_sweep.o').exists())
         self.assertTrue((gated_out / 'src/sp11_devhe_convert.o').exists())
+        self.assertFalse((gated_out / 'src/sp11_marker_surface.o').exists(),
+                         'the marker object belongs to SLBOUNCE_SP11_MARKERS only')
         # Leave the tree in its default state for anything that runs after this file.
+        self._clean_build(ROOT)
+
+    def test_each_gate_adds_only_its_own_code_and_the_lower_builds_are_unchanged(self):
+        scoped = self._clean_build(ROOT, ['SLBOUNCE_SCOPED_SWEEP=1'])
+        self.assertEqual((sha256(scoped / 'slbounce.efi'), (scoped / 'slbounce.efi').stat().st_size), SCOPED_ONLY)
+        devhe = self._clean_build(ROOT, ['SLBOUNCE_SCOPED_SWEEP=1', 'SLBOUNCE_SP11_DEVHE=1'])
+        self.assertEqual((sha256(devhe / 'slbounce.efi'), (devhe / 'slbounce.efi').stat().st_size), DEVHE_NO_MARKERS,
+                         'de-VHE without markers is no longer the build that was reviewed and tested')
+        # Every build lands in the same out/, so each hash is taken before the next build replaces it.
+        marks = self._clean_build(ROOT, ['SLBOUNCE_SCOPED_SWEEP=1', 'SLBOUNCE_SP11_DEVHE=1', 'SLBOUNCE_SP11_MARKERS=1'])
+        marks_hash = sha256(marks / 'slbounce.efi')
+        self.assertNotEqual(marks_hash, DEVHE_NO_MARKERS[0])
+        self.assertTrue((marks / 'src/sp11_marker_surface.o').exists())
+        dry = self._clean_build(ROOT, ['SLBOUNCE_SCOPED_SWEEP=1', 'SLBOUNCE_SP11_DEVHE=1', 'SLBOUNCE_SP11_MARKERS=1',
+                                       'SLBOUNCE_SP11_MARKERS_DRYRUN=1'])
+        self.assertNotEqual(sha256(dry / 'slbounce.efi'), marks_hash)
+        # The same markers with the sweep gate off still build (the two gates are independent).
+        alone = self._clean_build(ROOT, ['SLBOUNCE_SP11_DEVHE=1', 'SLBOUNCE_SP11_MARKERS=1'])
+        self.assertTrue((alone / 'slbounce.efi').exists())
         self._clean_build(ROOT)
 
 

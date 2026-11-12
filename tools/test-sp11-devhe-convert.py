@@ -460,7 +460,10 @@ class TransSequence(unittest.TestCase):
             if mnem == 'tlbi':
                 ops.append('TLBI')
             elif mnem == 'dsb':
-                ops.append('DSB')
+                # The model's DSB is DSB ISH. The progress markers close with DSB SY, which is
+                # not a model operation (tools/test-sp11-marker-surface.py checks them).
+                if (t[2].strip() if len(t) > 2 else '') == 'ish':
+                    ops.append('DSB')
             elif mnem == 'isb':
                 ops.append('ISB')
             elif mnem == 'msr':
@@ -509,9 +512,9 @@ class MutateTransSequence(unittest.TestCase):
 
     def test_dropping_the_second_tlbi_is_caught(self):
         text = (ROOT / 'src/trans.s').read_text(encoding='utf-8')
-        needle = "\tdsb\tish\n\ttlbi\talle2\n\tdsb\tish\n\tisb\n.else"
+        needle = "\tdsb\tish\n\ttlbi\talle2\n\tdsb\tish\n\tisb\n\tsp11_mark 3"
         self.assertIn(needle, text, 'mutation target not found (trans.s restructured?)')
-        mutated = text.replace(needle, '.else', 1)
+        mutated = text.replace(needle, '\tsp11_mark 3', 1)
         mutant_path = BUILD / 'trans-mutant-no-second-tlbi.s'
         mutant_path.write_text(mutated, encoding='utf-8')
         seq = TransSequence()
@@ -521,13 +524,14 @@ class MutateTransSequence(unittest.TestCase):
         self.assertNotEqual(observed, EXPECTED_ON, 'mutation (dropped second TLBI) was not caught')
 
 
-def _link_with_map(out_dir, map_path, reorder=None):
+def _link_with_map(out_dir, map_path, reorder=None, extra=()):
     """Builds the DEVHE-gated slbounce.so under out_dir with the project's own Makefile and a link
-    map next to it. `reorder`, if given, is a callable that rearranges the link line's argument list
-    (used by the mutation below to put the converter back at the end, where it used to be)."""
+    map next to it. `extra` adds make arguments (the marker gates). `reorder`, if given, is a
+    callable that rearranges the link line's argument list (used by the mutation below to put the
+    converter back at the end, where it used to be)."""
     shutil.rmtree(out_dir, ignore_errors=True)
     args = ['make', f'OUT_DIR={out_dir}', 'CROSS_COMPILE=aarch64-elf-', 'SLBOUNCE_ALWAYS_SWITCH=1', 'DEBUG=1',
-            'SLBOUNCE_SCOPED_SWEEP=1', 'SLBOUNCE_SP11_DEVHE=1', '-j4']
+            'SLBOUNCE_SCOPED_SWEEP=1', 'SLBOUNCE_SP11_DEVHE=1', *extra, '-j4']
     so = out_dir / 'slbounce.so'
     env = dict(ENV)
     # LDFLAGS in the environment is appended to by the Makefile's own `LDFLAGS +=`, not replaced.
@@ -589,6 +593,20 @@ class TbWindow(unittest.TestCase):
         sect = re.search(r'^ \.text\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+\S*src/trans\.o\s*$', self.text, re.M)
         start, size = int(sect.group(1), 16), int(sect.group(2), 16)
         self.assertTrue(lo <= start and start + size <= hi)
+
+    def test_the_marker_builds_keep_everything_inside_the_window_too(self):
+        """The markers add code and a refusal block to trans.o; it must still fit, with the converter."""
+        for label, extra in (('markers', ('SLBOUNCE_SP11_MARKERS=1',)),
+                             ('dry run', ('SLBOUNCE_SP11_MARKERS=1', 'SLBOUNCE_SP11_MARKERS_DRYRUN=1'))):
+            with self.subTest(build=label):
+                map_path = BUILD / f'tb-window-{label.replace(" ", "-")}.map'
+                _link_with_map(BUILD / f'tb-window-{label.replace(" ", "-")}', map_path, extra=extra)
+                text = map_path.read_text(encoding='utf-8', errors='replace')
+                lo, hi, start, end = _tb_window(text)
+                self.assertTrue(lo <= start and end <= hi, f'converter {start:#x}..{end:#x} outside {lo:#x}..{hi:#x}')
+                sect = re.search(r'^ \.text\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+\S*src/trans\.o\s*$', text, re.M)
+                t_start, t_size = int(sect.group(1), 16), int(sect.group(2), 16)
+                self.assertTrue(lo <= t_start and t_start + t_size <= hi, 'trans.o does not fit in the window')
 
     def test_a_far_placement_is_caught(self):
         """The old order (converter after libfdt) must fail the same check, or the check proves nothing."""

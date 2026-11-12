@@ -24,6 +24,25 @@
  * "CPTR_EL1" to convert from (this patch's REPORT.md explains the CPTR case fully). */
 .equ	SP11_DEVHE_HCR_A16,	0x88000010
 .equ	SP11_DEVHE_CPTR_NOTRAP,	0x22ff
+
+.ifdef SLBOUNCE_SP11_MARKERS
+/* The dry run is a mode of the markers: on its own it must change nothing, so everything below
+ * keys off this symbol, which exists only when both are set. */
+.ifdef SLBOUNCE_SP11_MARKERS_DRYRUN
+.set	SP11_DRYRUN_ACTIVE,	1
+.endif
+
+/* Progress markers (src/sp11_marker_surface.h has the C side and the reasoning). tb_jmp_buf carries
+ * two extra words, written by bounce_main.c before the launch and flushed with the rest of the
+ * buffer: the address of slot 0's top-left pixel (0 means no markers) and the framebuffer's row
+ * stride in bytes. The three constants below must equal SP11_MARKER_SIDE_PX, SP11_MARKER_STEP_PX
+ * and SP11_MARKER_SLOTS; tools/test-sp11-marker-surface.py checks that they do. */
+.equ	SP11_JB_MARK_ORIGIN,	168
+.equ	SP11_JB_MARK_STRIDE,	176
+.equ	SP11_MARK_SIDE,		32
+.equ	SP11_MARK_STEP_BYTES,	48 * 4
+.equ	SP11_MARK_SLOTS,	8
+.endif
 .endif
 
 
@@ -87,6 +106,54 @@ halt:
 	movk    \Xn, (\imm >> 32) & 0xFFFF, lsl 32
 	movk    \Xn, (\imm >> 48) & 0xFFFF, lsl 48
 .endm
+
+.ifdef SLBOUNCE_SP11_DEVHE
+.ifdef SLBOUNCE_SP11_MARKERS
+/*
+ * sp11_fill - fill a width_px by rows rectangle of white at x21 + off_bytes, doing nothing when
+ * x21 is 0 (no framebuffer strip). x22 is the row stride in bytes; x23 to x27 are scratch, and x21
+ * to x28 hold nothing tb_longjmp needs until its final ldp restores them. Register operands and
+ * stores only: the MMU is off here, so the stores are Device-nGnRnE writes straight to the
+ * framebuffer's DRAM, they need aligned addresses (the pixel size and stride guarantee that), and
+ * no stack is used. The closing dsb sy completes them before the next step so a hang in that step
+ * cannot leave a marker unwritten.
+ *
+ * Callers use it only after an isb that follows the last system register write, so no store is
+ * issued while a register write is still unsynchronized (the model's USE_BEFORE_SYNC rule);
+ * tools/test-sp11-marker-surface.py checks that from the assembled code.
+ */
+.macro sp11_fill off_bytes, width_px, rows
+	cbz	x21, 9f
+	mov	w26, #-1
+	add	x23, x21, #(\off_bytes)
+	mov	x24, #(\rows)
+1:	mov	x25, #(\width_px)
+	mov	x27, x23
+2:	str	w26, [x27], #4
+	subs	x25, x25, #1
+	b.ne	2b
+	add	x23, x23, x22
+	subs	x24, x24, #1
+	b.ne	1b
+	dsb	sy
+9:
+.endm
+
+.macro sp11_mark slot
+	sp11_fill SP11_MARK_STEP_BYTES*\slot,SP11_MARK_SIDE,SP11_MARK_SIDE
+.endm
+
+/* Every slot at once: the converter refused the saved TCR, so the sequence halts. */
+.macro sp11_mark_refused
+	sp11_fill 0,SP11_MARK_SLOTS*SP11_MARK_STEP_BYTES/4,SP11_MARK_SIDE
+.endm
+.else
+/* Without SLBOUNCE_SP11_MARKERS the call sites below assemble to nothing, so the de-VHE sequence is
+ * exactly the one that was reviewed and tested before the markers existed. */
+.macro sp11_mark slot
+.endm
+.endif
+.endif
 
 
 /*
@@ -179,9 +246,35 @@ tb_longjmp:
 	mov	x19, x0
 	mov	x20, x1
 
+.ifdef SLBOUNCE_SP11_MARKERS
+	/* Progress markers, when bounce_main.c armed them (x21 = 0 otherwise). Slot 0 was drawn
+	 * before ExitBootServices; each slot below means that step finished, so on a hang the
+	 * highest slot on screen is the last step that did. The tracked instruction order does not
+	 * change (tools/test-sp11-devhe-convert.py's TransSequence), and no marker is drawn between
+	 * a system register write and its isb. */
+	ldr	x21, [x19, #SP11_JB_MARK_ORIGIN]
+	ldr	x22, [x19, #SP11_JB_MARK_STRIDE]
+.endif
+	sp11_mark 1			// slot 1: tb_longjmp reached with the MMU off
+
+.ifdef SP11_DRYRUN_ACTIVE
+	/* Qualification of the framebuffer stores by themselves: draw every slot the real sequence
+	 * would and stop, before any de-VHE configuration write (the TLBI and the VBAR_EL2 and
+	 * TPIDR_EL0 restores that every slbounce restore starts with have already run), so a hang
+	 * or a missing square here says nothing about the conversion and everything about whether
+	 * these stores work on the unit. A visible square proves its stores landed, not that the
+	 * dsb sy that closes it returned; slot 4 therefore only acknowledges slot 3's barrier. Its
+	 * own barrier stays unproven, which is acceptable: it is the one a real run never relies on.
+	 * The rest of the sequence is not assembled in this build. */
+	sp11_mark 2
+	sp11_mark 3
+	sp11_mark 4
+	b	halt
+.else
 	movq	x2, SP11_DEVHE_HCR_A16
 	msr	hcr_el2, x2
 	isb
+	sp11_mark 2			// slot 2: HCR_EL2 written (E2H clear) and synchronized
 
 	/* CNTHCTL_EL2, non-VHE layout: the same two bits and the same numeric value as the plain
 	 * build's write below, but E2H is already 0 here, so they now mean what this file's own
@@ -206,7 +299,11 @@ tb_longjmp:
 	 * the existing fail-safe loop below, not a new one. */
 	ldr	x0, [x19, #136]
 	bl	sp11_devhe_tcr_vhe_to_nvhe
+.ifdef SLBOUNCE_SP11_MARKERS
+	cbz	x1, sp11_tb_refused
+.else
 	cbz	x1, halt
+.endif
 	msr	tcr_el2, x0
 	/* MAIR_EL2 (below, unchanged): no VHE/non-VHE layout difference exists for it
 	 * (docs/SP11-EL2-ENTRY.md section 2.7's layout list does not name it), so the saved
@@ -241,6 +338,8 @@ tb_longjmp:
 	tlbi	alle2
 	dsb	ish
 	isb
+	sp11_mark 3			// slot 3: configuration and TLB maintenance done; the next write turns the MMU on
+.endif
 .else
 	movq	x2, (HCR_EL2_TGE | HCR_EL2_E2H)
 	msr	hcr_el2, x2
@@ -285,6 +384,21 @@ tb_longjmp:
 	csinc w0, w1, wzr, ne		// x0 = (x1 ? x1 : 1)
 	br	x30
 
+.ifdef SLBOUNCE_SP11_MARKERS
+.ifndef SP11_DRYRUN_ACTIVE
+/*
+ * Reached from tb_longjmp when the saved TCR image cannot be converted. Out of line so the
+ * instruction order of tb_longjmp itself, which TransSequence compares with the model, holds only
+ * the path that converts. The isb synchronizes the register writes made so far before any store,
+ * then every marker slot is lit, and the sequence halts as it always has.
+ */
+sp11_tb_refused:
+	isb
+	sp11_mark_refused
+	b	halt
+.endif
+.endif
+
 
 .data
 
@@ -294,3 +408,6 @@ tb_jmp_buf:
 	.zero	8 * 12	// x19-x30 - callee saved registers.
 	.zero	8 * 1	// x31 - sp
 	.zero	8 * 8	// System registers
+.ifdef SLBOUNCE_SP11_MARKERS
+	.zero	8 * 2	// Progress marker origin and stride (SP11_JB_MARK_*)
+.endif
